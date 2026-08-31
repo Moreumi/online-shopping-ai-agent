@@ -5,7 +5,7 @@ from app.data.sample_data import (
     payments,
     refunds,
 )
-from app.services.order_payment_service import cancel_order
+
 from app.services.orchestrator import handle_pending_state
 
 
@@ -15,25 +15,53 @@ def prepare_refund_account_state():
     test_payments = deepcopy(payments)
     test_refunds = deepcopy(refunds)
 
-    # 계좌이체 주문을 먼저 취소
-    cancel_result = cancel_order(
+    # -----------------------------------------------------
+    # 주문 취소 최종 승인 상태 준비
+    # -----------------------------------------------------
+
+    test_state = {
+        "pending_action": "confirm_cancel",
+        "candidate_orders": [],
+        "selected_order_id": 10006,
+        "pending_data": {},
+    }
+
+    # -----------------------------------------------------
+    # 실제 새 Order Cancel Flow 실행
+    #
+    # confirm_cancel
+    # → Refund 사전 검증
+    # → cancel_order_action
+    # → start_refund
+    # → collect_refund_account
+    # -----------------------------------------------------
+
+    cancel_result = handle_pending_state(
+        user_input="예",
+        customer_id=5,
         orders=test_orders,
         payments=test_payments,
         refunds=test_refunds,
-        customer_id=5,
-        order_id=10006,
+        state=test_state,
     )
 
     assert (
-        cancel_result["refund_status"]
+        cancel_result["result"]["refund_status"]
         == "refund_account_required"
     )
 
-    test_state = {
-        "pending_action": "collect_refund_account",
-        "candidate_orders": [],
-        "selected_order_id": 10006,
-    }
+    # 공통 Refund Pending Flow로 이동했는지 확인
+    assert (
+        test_state["pending_action"]
+        == "collect_refund_account"
+    )
+
+    assert test_state["selected_order_id"] == 10006
+
+    # 공통 Handler가 사용할 Refund Context 확인
+    assert test_state["pending_data"]["refund_id"] is not None
+    assert test_state["pending_data"]["refund_type"] == "full"
+    assert test_state["pending_data"]["source"] == "order_cancel"
 
     return (
         test_orders,
@@ -79,7 +107,7 @@ def test_refund_account_multiturn_success():
     # 작업이 끝났으므로 State 초기화
     assert test_state["pending_action"] is None
     assert test_state["selected_order_id"] is None
-
+    assert test_state["pending_data"] == {}
 
 def test_invalid_refund_account_keeps_state():
 

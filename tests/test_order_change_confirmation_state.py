@@ -449,7 +449,7 @@ def test_order_change_confirmation_cash_refund_waits_for_account():
 
     assert (
         state["pending_action"]
-        == "collect_partial_refund_account"
+        == "collect_refund_account"
     )
 
     assert state["selected_order_id"] == 10007

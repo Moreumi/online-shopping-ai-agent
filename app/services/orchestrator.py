@@ -7,8 +7,7 @@ from app.services.order_payment_service import (
     generate_payment_response,
     check_order_payment_consistency,
     check_order_cancel_eligibility,
-    cancel_order,
-    register_refund_account,
+    cancel_order_action,
     check_delivery_address_change_eligibility,
     change_delivery_address,
     check_order_change,
@@ -50,8 +49,9 @@ from app.policies.delivery_eta_policy import (
 )
 
 from app.services.refund_service import (
+    validate_refund_request,
     start_refund,
-    register_refund_account as register_partial_refund_account,
+    register_refund_account as register_refund_account_common,
 )
 
 
@@ -743,9 +743,7 @@ def build_order_change_response(result: dict) -> str:
             "현재 주문 상태에서는 수량 변경을 진행하기 어렵습니다."
         )
 
-    # -----------------------------------------------------
     # 수량 정보 추가 입력 필요
-    # -----------------------------------------------------
 
     if result_type == "need_quantity_input":
         current_quantity = result["current_quantity"]
@@ -756,9 +754,7 @@ def build_order_change_response(result: dict) -> str:
             "예: '3개로 변경', '1개 추가', '1개 줄여줘'"
         )
 
-    # -----------------------------------------------------
     # 수량 0 → 주문 취소 필요
-    # -----------------------------------------------------
 
     if result_type == "cancel_required":
         return (
@@ -767,9 +763,7 @@ def build_order_change_response(result: dict) -> str:
             "원하시면 주문 취소를 요청해 주세요."
         )
 
-    # -----------------------------------------------------
     # 잘못된 수량
-    # -----------------------------------------------------
 
     if result_type == "invalid_quantity":
         return (
@@ -777,16 +771,12 @@ def build_order_change_response(result: dict) -> str:
             "변경할 수량을 다시 입력해 주세요."
         )
 
-    # -----------------------------------------------------
     # 현재와 동일한 수량
-    # -----------------------------------------------------
 
     if result_type == "no_change":
         return "현재 주문 수량과 동일하여 변경할 내용이 없습니다."
 
-    # -----------------------------------------------------
     # 주문 데이터 불일치
-    # -----------------------------------------------------
 
     if result_type == "data_inconsistent":
         return (
@@ -794,9 +784,7 @@ def build_order_change_response(result: dict) -> str:
             "수량 변경을 진행할 수 없습니다."
         )
 
-    # -----------------------------------------------------
     # 정상 Preview → 최종 승인 요청
-    # -----------------------------------------------------
 
     if result_type == "change_preview":
         calculation = result["calculation"]
@@ -914,9 +902,7 @@ def handle_pending_state(
                 "response": "변경할 새로운 배송지를 입력해 주세요.",
             }
 
-        # -------------------------------------------------
         # 새 주소는 실제 주문에 반영하지 않고 State에만 저장
-        # -------------------------------------------------
 
         state["pending_data"]["new_delivery_address"] = (
             new_delivery_address
@@ -949,7 +935,7 @@ def handle_pending_state(
             ),
         }
 
-        # -----------------------------------------------------
+    # -----------------------------------------------------
     # 배송지 변경 - 최종 승인
     # -----------------------------------------------------
 
@@ -993,9 +979,7 @@ def handle_pending_state(
                 ),
             }
 
-        # -------------------------------------------------
         # 사용자 최종 승인 여부 확인
-        # -------------------------------------------------
 
         confirmation = extract_confirmation(user_input)
 
@@ -1011,9 +995,7 @@ def handle_pending_state(
                 ),
             }
 
-        # -------------------------------------------------
         # 사용자가 변경을 거절
-        # -------------------------------------------------
 
         if confirmation is False:
             reset_state(state)
@@ -1027,10 +1009,8 @@ def handle_pending_state(
                 "response": "배송지 변경을 진행하지 않았습니다.",
             }
 
-        # -------------------------------------------------
         # 사용자가 명확하게 승인
         # 여기서만 Write Action 실행
-        # -------------------------------------------------
 
         result = change_delivery_address(
             orders=orders,
@@ -1182,23 +1162,132 @@ def handle_pending_state(
                 "response": "주문 취소를 진행하지 않았습니다.",
             }
 
+        # -------------------------------------------------
         # 사용자가 명확하게 승인한 경우
-        # 여기서만 Write Action 실행
+        # 여기에서만 실제 Write Flow 실행
+        # -------------------------------------------------
+
         if payments is None:
             payments = []
 
         if refunds is None:
             refunds = []
 
-        result = cancel_order(
+        # 1. Refund 사전 검증
+        #
+        # 주문/결제 데이터를 먼저 취소한 뒤
+        # 환불 불가능 상태를 발견하는 것을 방지한다.
+
+        refund_validation = validate_refund_request(
+            payments=payments,
+            order_id=selected_order_id,
+            refund_type="full",
+            refund_amount=None,
+        )
+
+        if refund_validation["result_type"] != "success":
+            reset_state(state)
+
+            return {
+                "route": "order_cancel",
+                "result": refund_validation,
+                "response": (
+                    "주문 취소에 필요한 환불 정보를 확인하지 못했습니다. "
+                    "현재 결제 상태를 다시 확인해 주세요."
+                ),
+            }
+
+        # 2. 주문 / 결제 취소 Action
+        #
+        # Refund 생성은 이 함수가 담당하지 않는다.
+
+        cancel_result = cancel_order_action(
             orders=orders,
             payments=payments,
-            refunds=refunds,
             customer_id=customer_id,
             order_id=selected_order_id,
         )
 
+        if cancel_result["result_type"] != "success":
+            reset_state(state)
+
+            return {
+                "route": "order_cancel",
+                "result": cancel_result,
+                "response": build_order_cancel_action_response(
+                    cancel_result
+                ),
+            }
+
+        # 3. 공통 Refund Service 연결
+
+        refund_result = start_refund(
+            payments=payments,
+            refunds=refunds,
+            order_id=selected_order_id,
+            refund_amount=None,
+            refund_type="full",
+            refund_reason="order_cancel",
+        )
+
+        # 4. Refund 시작 실패
+        #
+        # 이 시점에는 주문/결제 취소 Action은 이미 완료되었다.
+        # 따라서 전체 취소가 실패했다고 표현하지 않는다.
+
+        if refund_result["result_type"] == "action_failed":
+            reset_state(state)
+
+            return {
+                "route": "order_cancel",
+                "result": {
+                    "order_cancel": cancel_result,
+                    "refund": refund_result,
+                },
+                "response": (
+                    "주문과 결제는 취소되었지만 "
+                    "환불 절차를 시작하는 중 문제가 발생했습니다. "
+                    "환불 상태를 추가로 확인해 주세요."
+                ),
+            }
+
+        # 5. 기존 Response Interface 유지
+        #
+        # 기존 테스트와 외부 Flow에 불필요한 영향을 주지 않도록
+        # Order Cancel 결과와 Refund 결과를 하나의 결과로 조합한다.
+
+        result = {
+            **cancel_result,
+            **refund_result,
+        }
+
         response = build_order_cancel_action_response(result)
+
+        # 6. 계좌이체 → 환불계좌 입력 필요
+
+        if result["result_type"] == "refund_account_required":
+            state["pending_action"] = "collect_refund_account"
+            state["candidate_orders"] = []
+            state["selected_order_id"] = selected_order_id
+
+            # 다음 단계에서 공통 Refund State로 통합하기 위해
+            # 현재 Refund Context도 저장한다.
+            state["pending_data"] = {
+                "refund_id": result["refund_id"],
+                "refund_amount": result["refund_amount"],
+                "refund_type": "full",
+                "source": "order_cancel",
+            }
+
+        # 카드 Refund 시작 성공
+        else:
+            reset_state(state)
+
+        return {
+            "route": "order_cancel",
+            "result": result,
+            "response": response,
+        }
 
         # 계좌이체라 환불계좌가 필요한 경우
         if result["result_type"] == "refund_account_required":
@@ -1215,15 +1304,19 @@ def handle_pending_state(
             "result": result,
             "response": response,
         }
+
     # -----------------------------------------------------
-    # 주문 수량 감소 - 부분 환불계좌 정보 입력
+    # 공통 환불계좌 정보 입력
     # -----------------------------------------------------
 
-    if state["pending_action"] == "collect_partial_refund_account":
+    if state["pending_action"] == "collect_refund_account":
 
         selected_order_id = state["selected_order_id"]
 
         refund_id = state["pending_data"].get("refund_id")
+        refund_amount = state["pending_data"].get("refund_amount")
+        refund_type = state["pending_data"].get("refund_type")
+        source = state["pending_data"].get("source")
 
         # 1. State 정보 확인
 
@@ -1231,13 +1324,13 @@ def handle_pending_state(
             reset_state(state)
 
             return {
-                "route": "order_change",
+                "route": source or "refund",
                 "result": {
                     "result_type": "action_failed",
-                    "reason": "partial_refund_state_not_found",
+                    "reason": "refund_state_not_found",
                 },
                 "response": (
-                    "부분 환불 정보를 확인할 수 없습니다. "
+                    "환불 정보를 확인할 수 없습니다. "
                     "환불 상태를 다시 확인해 주세요."
                 ),
             }
@@ -1248,94 +1341,7 @@ def handle_pending_state(
 
         if account_info is None:
             return {
-                "route": "order_change",
-                "result": None,
-                "response": (
-                    "환불받으실 계좌 정보를 다시 입력해 주세요.\n"
-                    "예: 국민은행 / 1234567890 / 홍길동"
-                ),
-            }
-
-        # 3. Refund 데이터 확인
-
-        if refunds is None:
-            refunds = []
-
-        # 4. 환불계좌 등록 Action
-
-        result = register_partial_refund_account(
-            refunds=refunds,
-            refund_id=refund_id,
-            bank_name=account_info["bank_name"],
-            account_number=account_info["account_number"],
-            account_holder=account_info["account_holder"],
-        )
-
-        # 5. 계좌 등록 성공
-
-        if result["result_type"] == "success":
-
-            reset_state(state)
-
-            return {
-                "route": "order_change",
-                "result": result,
-                "response": (
-                    f"환불계좌가 정상적으로 등록되었습니다. "
-                    f"주문번호 {result['order_id']}번의 "
-                    f"부분 환불 금액 "
-                    f"{result['refund_amount']:,}원은 "
-                    "현재 환불 처리 중입니다."
-                ),
-            }
-
-        # 6. 계좌 등록 실패
-
-        reset_state(state)
-
-        return {
-            "route": "order_change",
-            "result": result,
-            "response": (
-                "환불계좌를 등록하는 중 문제가 발생했습니다. "
-                "환불 상태를 다시 확인해 주세요."
-            ),
-        }
-
-
-    # -----------------------------------------------------
-    # 환불계좌 정보 입력
-    # -----------------------------------------------------
-
-    if state["pending_action"] == "collect_refund_account":
-
-        selected_order_id = state["selected_order_id"]
-
-        # 어떤 주문의 환불인지 확인할 수 없는 경우
-        if selected_order_id is None:
-            reset_state(state)
-
-            return {
-                "route": "order_cancel",
-                "result": {
-                    "result_type": "action_failed",
-                    "reason": "selected_order_not_found",
-                },
-                "response": (
-                    "환불할 주문 정보를 확인할 수 없습니다. "
-                    "주문번호를 다시 확인해 주세요."
-                ),
-            }
-
-        # -------------------------------------------------
-        # 사용자 입력에서 환불계좌 정보 추출
-
-        account_info = extract_refund_account(user_input)
-
-        # 입력 형식이 올바르지 않은 경우
-        if account_info is None:
-            return {
-                "route": "order_cancel",
+                "route": source or "refund",
                 "result": None,
                 "response": (
                     "환불계좌 정보를 다음 형식으로 입력해 주세요.\n"
@@ -1344,47 +1350,69 @@ def handle_pending_state(
                 ),
             }
 
-        # refunds가 전달되지 않은 경우
         if refunds is None:
             refunds = []
 
-        # -------------------------------------------------
-        # 환불계좌 등록 Action
+        # 3. 공통 Refund Service에서 계좌 등록
 
-        result = register_refund_account(
+        result = register_refund_account_common(
             refunds=refunds,
-            order_id=selected_order_id,
+            refund_id=refund_id,
             bank_name=account_info["bank_name"],
             account_number=account_info["account_number"],
             account_holder=account_info["account_holder"],
         )
 
-        # -------------------------------------------------
-        # 계좌 등록 성공
+        # 4. 계좌 등록 성공
 
         if result["result_type"] == "success":
+
             reset_state(state)
 
+            # 주문 수량 감소에 따른 부분 환불
+            if source == "order_change":
+                return {
+                    "route": "order_change",
+                    "result": result,
+                    "response": (
+                        "환불계좌가 정상적으로 등록되었습니다. "
+                        f"주문번호 {result['order_id']}번의 "
+                        f"부분 환불 금액 "
+                        f"{result['refund_amount']:,}원은 "
+                        "현재 환불 처리 중입니다."
+                    ),
+                }
+
+            # 주문 취소에 따른 전체 환불
+            if source == "order_cancel":
+                return {
+                    "route": "order_cancel",
+                    "result": result,
+                    "response": (
+                        "환불계좌가 정상적으로 등록되었습니다. "
+                        "계좌이체 환불은 현재 환불 처리 중입니다."
+                    ),
+                }
+
+            # 정의되지 않은 Refund Source
             return {
-                "route": "order_cancel",
+                "route": "refund",
                 "result": result,
                 "response": (
                     "환불계좌가 정상적으로 등록되었습니다. "
-                    "계좌이체 환불은 영업일 기준 "
-                    "3~5일 정도 소요될 수 있습니다."
+                    "현재 환불 처리 중입니다."
                 ),
             }
 
-        # -------------------------------------------------
-        # 계좌 등록 Action 실패
+        # 5. 계좌 등록 실패
 
         reset_state(state)
 
         return {
-            "route": "order_cancel",
+            "route": source or "refund",
             "result": result,
             "response": (
-                "환불계좌 등록 중 문제가 발생했습니다. "
+                "환불계좌를 등록하는 중 문제가 발생했습니다. "
                 "환불 상태를 다시 확인해 주세요."
             ),
         }
@@ -1890,9 +1918,7 @@ def handle_pending_state(
                     == "refund_account_required"
                 ):
 
-                    state["pending_action"] = (
-                        "collect_partial_refund_account"
-                    )
+                    state["pending_action"] = "collect_refund_account"
                     state["candidate_orders"] = []
                     state["selected_order_id"] = selected_order_id
                     state["pending_data"] = {

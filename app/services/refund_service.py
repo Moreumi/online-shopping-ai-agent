@@ -1,32 +1,21 @@
-# =========================================================
-# 공통 환불 처리 Service
-# =========================================================
 
-
-def start_refund(
+def validate_refund_request(
     payments: list[dict],
-    refunds: list[dict],
     order_id: int,
-    refund_amount: int,
     refund_type: str,
-    refund_reason: str,
-    adjustment_id: int | None = None,
+    refund_amount: int | None = None,
 ) -> dict:
     """
-    이미 환불 필요성이 확정된 이후
-    공통 환불 절차를 시작한다.
+    실제 Refund 데이터를 생성하기 전에
+    환불 요청이 처리 가능한지 검증한다.
 
-    이 함수는:
-    - 결제정보를 확인하고
-    - 환불금액을 검증하고
-    - 결제수단에 따라 환불 상태를 결정하고
-    - refunds에 환불 데이터를 생성한다.
+    데이터는 변경하지 않는다.
 
-    실제 PG 환불 완료 처리는 수행하지 않는다.
+    full refund에서 refund_amount가 전달되지 않으면
+    실제 결제금액 전체를 환불금액으로 사용한다.
     """
 
     # 1. 결제정보 확인
-
     payment = next(
         (
             payment
@@ -43,24 +32,7 @@ def start_refund(
             "order_id": order_id,
         }
 
-    # 2. 환불금액 검증
-
-    if refund_amount <= 0:
-        return {
-            "result_type": "action_failed",
-            "reason": "invalid_refund_amount",
-            "order_id": order_id,
-        }
-
-    if refund_amount > payment["payment_amount"]:
-        return {
-            "result_type": "action_failed",
-            "reason": "refund_amount_exceeds_payment",
-            "order_id": order_id,
-        }
-
-    # 3. 환불 유형 검증
-
+    # 2. 환불 유형 검증
     if refund_type not in {"full", "partial"}:
         return {
             "result_type": "action_failed",
@@ -68,8 +40,30 @@ def start_refund(
             "order_id": order_id,
         }
 
-    # 4. 결제수단 확인
+    # 3. 실제 환불금액 결정
+    if refund_type == "full" and refund_amount is None:
+        resolved_refund_amount = payment["payment_amount"]
+    else:
+        resolved_refund_amount = refund_amount
 
+    if (
+        resolved_refund_amount is None
+        or resolved_refund_amount <= 0
+    ):
+        return {
+            "result_type": "action_failed",
+            "reason": "invalid_refund_amount",
+            "order_id": order_id,
+        }
+
+    if resolved_refund_amount > payment["payment_amount"]:
+        return {
+            "result_type": "action_failed",
+            "reason": "refund_amount_exceeds_payment",
+            "order_id": order_id,
+        }
+
+    # 4. 지원 가능한 결제수단 확인
     payment_method = payment["payment_method"]
 
     if payment_method not in {"card", "cash"}:
@@ -79,7 +73,64 @@ def start_refund(
             "order_id": order_id,
         }
 
-    # 5. Refund ID 생성
+    # 5. 검증 결과 반환
+    return {
+        "result_type": "success",
+        "order_id": order_id,
+        "payment_id": payment["payment_id"],
+        "payment_method": payment_method,
+        "payment_amount": payment["payment_amount"],
+        "refund_type": refund_type,
+        "refund_amount": resolved_refund_amount,
+    }
+
+
+# =========================================================
+# 공통 환불 처리 Service
+# =========================================================
+
+def start_refund(
+    payments: list[dict],
+    refunds: list[dict],
+    order_id: int,
+    refund_amount: int | None,
+    refund_type: str,
+    refund_reason: str,
+    adjustment_id: int | None = None,
+) -> dict:
+    """
+    이미 환불 필요성이 확정된 이후
+    공통 환불 절차를 시작한다.
+
+    환불 가능 여부 검증은 validate_refund_request()에 위임하고,
+    이 함수는 검증된 정보를 기준으로
+    실제 Refund 데이터를 생성하고 상태를 결정한다.
+
+    실제 PG 환불 완료 처리는 수행하지 않는다.
+    """
+
+    # -----------------------------------------------------
+    # 1. 공통 Refund 검증
+    # -----------------------------------------------------
+
+    validation_result = validate_refund_request(
+        payments=payments,
+        order_id=order_id,
+        refund_type=refund_type,
+        refund_amount=refund_amount,
+    )
+
+    if validation_result["result_type"] != "success":
+        return validation_result
+
+    # 검증된 값을 사용한다.
+    payment_id = validation_result["payment_id"]
+    payment_method = validation_result["payment_method"]
+    resolved_refund_amount = validation_result["refund_amount"]
+
+    # -----------------------------------------------------
+    # 2. Refund ID 생성
+    # -----------------------------------------------------
 
     refund_id = (
         max(
@@ -91,7 +142,9 @@ def start_refund(
         else 70001
     )
 
-    # 6. 결제수단에 따른 환불 상태 결정
+    # -----------------------------------------------------
+    # 3. 결제수단에 따른 Refund 상태 결정
+    # -----------------------------------------------------
 
     if payment_method == "card":
         refund_status = "refund_processing"
@@ -101,14 +154,16 @@ def start_refund(
         refund_status = "refund_account_required"
         result_type = "refund_account_required"
 
-    # 7. 환불 데이터 생성
+    # -----------------------------------------------------
+    # 4. Refund 데이터 생성
+    # -----------------------------------------------------
 
     refund = {
         "refund_id": refund_id,
-        "payment_id": payment["payment_id"],
+        "payment_id": payment_id,
         "order_id": order_id,
         "refund_type": refund_type,
-        "refund_amount": refund_amount,
+        "refund_amount": resolved_refund_amount,
         "refund_reason": refund_reason,
         "refund_status": refund_status,
         "adjustment_id": adjustment_id,
@@ -119,24 +174,26 @@ def start_refund(
 
     refunds.append(refund)
 
-    # 8. 결과 반환
+    # -----------------------------------------------------
+    # 5. 결과 반환
+    # -----------------------------------------------------
 
     return {
         "result_type": result_type,
         "order_id": order_id,
-        "payment_id": payment["payment_id"],
+        "payment_id": payment_id,
         "payment_method": payment_method,
         "refund_id": refund_id,
         "refund_type": refund_type,
-        "refund_amount": refund_amount,
+        "refund_amount": resolved_refund_amount,
         "refund_reason": refund_reason,
         "refund_status": refund_status,
         "adjustment_id": adjustment_id,
     }
+
 # =========================================================
 # 환불계좌 등록
 # =========================================================
-
 
 def register_refund_account(
     refunds: list[dict],
@@ -154,7 +211,6 @@ def register_refund_account(
     """
 
     # 1. 환불 데이터 확인
-
     refund = next(
         (
             refund
@@ -172,7 +228,6 @@ def register_refund_account(
         }
 
     # 2. 현재 환불 상태 재확인
-
     if refund["refund_status"] != "refund_account_required":
         return {
             "result_type": "action_failed",
@@ -181,7 +236,6 @@ def register_refund_account(
         }
 
     # 3. 계좌정보 검증
-
     if (
         not bank_name.strip()
         or not account_number.strip()
@@ -194,7 +248,6 @@ def register_refund_account(
         }
 
     # 4. 계좌정보 저장
-
     refund["bank_name"] = bank_name.strip()
     refund["account_number"] = account_number.strip()
     refund["account_holder"] = account_holder.strip()
@@ -202,7 +255,6 @@ def register_refund_account(
     refund["refund_status"] = "refund_processing"
 
     # 5. 결과 반환
-
     return {
         "result_type": "success",
         "refund_id": refund["refund_id"],

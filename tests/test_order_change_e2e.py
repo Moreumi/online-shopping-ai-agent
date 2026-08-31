@@ -511,7 +511,7 @@ def test_order_change_partial_cash_refund_full_e2e():
 
     assert (
         test_state["pending_action"]
-        == "collect_partial_refund_account"
+        == "collect_refund_account"
     )
 
     assert test_state["selected_order_id"] == 10007

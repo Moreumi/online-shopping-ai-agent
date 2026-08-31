@@ -24,7 +24,7 @@ def test_partial_refund_account_input_continues_pending_flow():
     ]
 
     state = {
-        "pending_action": "collect_partial_refund_account",
+        "pending_action": "collect_refund_account",
         "candidate_orders": [],
         "selected_order_id": 10007,
         "pending_data": {

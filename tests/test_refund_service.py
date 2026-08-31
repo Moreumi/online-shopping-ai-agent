@@ -240,3 +240,105 @@ def test_register_refund_account_invalid_refund_status():
 
     assert result["result_type"] == "action_failed"
     assert result["reason"] == "invalid_refund_status"
+
+# =========================================================
+# validate_refund_request
+# =========================================================
+
+def test_validate_full_refund_resolves_payment_amount():
+    from app.services.refund_service import validate_refund_request
+
+    payments = [
+        {
+            "payment_id": 50001,
+            "order_id": 10001,
+            "payment_amount": 60000,
+            "payment_method": "card",
+            "payment_status": "payment_completed",
+        }
+    ]
+
+    result = validate_refund_request(
+        payments=payments,
+        order_id=10001,
+        refund_type="full",
+        refund_amount=None,
+    )
+
+    assert result["result_type"] == "success"
+    assert result["refund_type"] == "full"
+    assert result["refund_amount"] == 60000
+    assert result["payment_method"] == "card"
+
+
+def test_validate_partial_refund_uses_requested_amount():
+    from app.services.refund_service import validate_refund_request
+
+    payments = [
+        {
+            "payment_id": 50001,
+            "order_id": 10001,
+            "payment_amount": 60000,
+            "payment_method": "card",
+            "payment_status": "payment_completed",
+        }
+    ]
+
+    result = validate_refund_request(
+        payments=payments,
+        order_id=10001,
+        refund_type="partial",
+        refund_amount=20000,
+    )
+
+    assert result["result_type"] == "success"
+    assert result["refund_type"] == "partial"
+    assert result["refund_amount"] == 20000
+
+
+def test_validate_refund_rejects_invalid_refund_type():
+    from app.services.refund_service import validate_refund_request
+
+    payments = [
+        {
+            "payment_id": 50001,
+            "order_id": 10001,
+            "payment_amount": 60000,
+            "payment_method": "card",
+            "payment_status": "payment_completed",
+        }
+    ]
+
+    result = validate_refund_request(
+        payments=payments,
+        order_id=10001,
+        refund_type="invalid",
+        refund_amount=20000,
+    )
+
+    assert result["result_type"] == "action_failed"
+    assert result["reason"] == "invalid_refund_type"
+
+
+def test_validate_refund_rejects_unsupported_payment_method():
+    from app.services.refund_service import validate_refund_request
+
+    payments = [
+        {
+            "payment_id": 50001,
+            "order_id": 10001,
+            "payment_amount": 60000,
+            "payment_method": "unsupported",
+            "payment_status": "payment_completed",
+        }
+    ]
+
+    result = validate_refund_request(
+        payments=payments,
+        order_id=10001,
+        refund_type="full",
+        refund_amount=None,
+    )
+
+    assert result["result_type"] == "action_failed"
+    assert result["reason"] == "unsupported_payment_method"

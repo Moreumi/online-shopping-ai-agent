@@ -552,26 +552,26 @@ def check_order_change(
 
 
 # =========================================================
-# 주문 취소 Action
+# 주문 취소 순수 Action
 # =========================================================
 
-def cancel_order(
+def cancel_order_action(
     orders: list[dict],
     payments: list[dict],
-    refunds: list[dict],
     customer_id: int,
     order_id: int,
 ) -> dict:
     """
     사용자의 최종 승인이 확인된 이후
-    실제 주문 및 결제 상태를 취소 처리한다.
+    실제 주문과 결제 상태만 취소 처리한다.
 
-    이 함수는 Write Action이므로
-    Orchestrator가 사용자 승인을 확인한 이후에만 호출해야 한다.
+    Refund 생성이나 환불 상태 관리는 수행하지 않는다.
+    환불 처리는 Orchestrator가 Refund Service와 연결한다.
     """
 
     # -----------------------------------------------------
     # 1. 고객의 주문 확인
+    # -----------------------------------------------------
 
     order = next(
         (
@@ -592,6 +592,7 @@ def cancel_order(
 
     # -----------------------------------------------------
     # 2. 결제 정보 확인
+    # -----------------------------------------------------
 
     payment = next(
         (
@@ -610,7 +611,8 @@ def cancel_order(
         }
 
     # -----------------------------------------------------
-    # 3. Action 직전 주문 취소 가능 여부 재확인
+    # 3. Action 직전 주문 취소 가능 여부 재검증
+    # -----------------------------------------------------
 
     cancel_result = judge_order_cancel(
         order_status=order["order_status"],
@@ -624,7 +626,10 @@ def cancel_order(
             "order_id": order_id,
         }
 
-    # 결제 상태도 Action 직전에 다시 확인
+    # -----------------------------------------------------
+    # 4. Action 직전 결제 상태 재검증
+    # -----------------------------------------------------
+
     if payment["payment_status"] != "payment_completed":
         return {
             "result_type": "action_failed",
@@ -632,147 +637,25 @@ def cancel_order(
             "order_id": order_id,
         }
 
-    payment_method = payment["payment_method"]
-
-    if payment_method not in {"card", "cash"}:
-        return {
-            "result_type": "action_failed",
-            "reason": "unsupported_payment_method",
-            "order_id": order_id,
-        }
-
     # -----------------------------------------------------
-    # 4. 주문 및 결제 취소
+    # 5. 실제 주문 / 결제 취소
+    # -----------------------------------------------------
 
     order["order_status"] = "order_canceled"
     payment["payment_status"] = "payment_canceled"
 
     # -----------------------------------------------------
-    # 5. Refund ID 생성
-
-    refund_id = (
-        max(
-            refund["refund_id"]
-            for refund in refunds
-        )
-        + 1
-        if refunds
-        else 70001
-    )
-
-    # -----------------------------------------------------
-    # 6. 결제 방식에 따른 환불 상태 결정
-
-    if payment_method == "card":
-        refund_status = "refund_processing"
-        result_type = "success"
-
-    else:
-        refund_status = "refund_account_required"
-        result_type = "refund_account_required"
-
-    # -----------------------------------------------------
-    # 7. 환불 데이터 생성
-
-    refund = {
-        "refund_id": refund_id,
-        "payment_id": payment["payment_id"],
-        "order_id": order_id,
-        "refund_amount": payment["payment_amount"],
-        "refund_status": refund_status,
-        "bank_name": None,
-        "account_number": None,
-        "account_holder": None,
-    }
-
-    refunds.append(refund)
-
-    # -----------------------------------------------------
-    # 8. Action 결과 반환
-
-    return {
-        "result_type": result_type,
-        "order_id": order_id,
-        "order_status": order["order_status"],
-        "payment_id": payment["payment_id"],
-        "payment_method": payment_method,
-        "payment_status": payment["payment_status"],
-        "refund_id": refund_id,
-        "refund_status": refund_status,
-    }
-
-# =========================================================
-# 환불계좌 등록 Action
-# =========================================================
-
-def register_refund_account(
-    refunds: list[dict],
-    order_id: int,
-    bank_name: str,
-    account_number: str,
-    account_holder: str,
-) -> dict:
-    """
-    계좌이체 주문 취소 후 환불계좌를 등록한다.
-
-    refund_account_required 상태인 환불 건에만
-    계좌정보를 저장하고 refund_processing으로 변경한다.
-    """
-
-    # -----------------------------------------------------
-    # 1. 해당 주문의 환불 데이터 확인
-    # -----------------------------------------------------
-
-    refund = next(
-        (
-            refund
-            for refund in refunds
-            if refund["order_id"] == order_id
-        ),
-        None,
-    )
-
-    if refund is None:
-        return {
-            "result_type": "action_failed",
-            "reason": "refund_not_found",
-            "order_id": order_id,
-        }
-
-    # -----------------------------------------------------
-    # 2. 현재 환불 상태 재확인
-    # -----------------------------------------------------
-
-    if refund["refund_status"] != "refund_account_required":
-        return {
-            "result_type": "action_failed",
-            "reason": "invalid_refund_status",
-            "order_id": order_id,
-        }
-
-    # -----------------------------------------------------
-    # 3. 환불계좌 정보 저장
-    # -----------------------------------------------------
-
-    refund["bank_name"] = bank_name
-    refund["account_number"] = account_number
-    refund["account_holder"] = account_holder
-
-    # 계좌정보 등록 완료 → 환불 처리중
-    refund["refund_status"] = "refund_processing"
-
-    # -----------------------------------------------------
-    # 4. 결과 반환
+    # 6. Action 결과 반환
     # -----------------------------------------------------
 
     return {
         "result_type": "success",
         "order_id": order_id,
-        "refund_id": refund["refund_id"],
-        "refund_status": refund["refund_status"],
-        "bank_name": refund["bank_name"],
-        "account_number": refund["account_number"],
-        "account_holder": refund["account_holder"],
+        "order_status": order["order_status"],
+        "payment_id": payment["payment_id"],
+        "payment_method": payment["payment_method"],
+        "payment_amount": payment["payment_amount"],
+        "payment_status": payment["payment_status"],
     }
 
 # =========================================================
