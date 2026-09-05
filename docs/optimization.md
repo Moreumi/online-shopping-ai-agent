@@ -606,41 +606,270 @@ Refund 관련 Business Logic의 관리 위치를 하나로 통합했다는 점�
 
 # 2. Orchestrator Structure Optimization
 
-> 다음 최적화 단계에서 진행 예정
+## 2-1. 문제 발견
 
-현재 `orchestrator.py`는
-질문 분류 이후 Routing뿐만 아니라
-여러 기능의 Multi-turn State 처리까지 직접 담당하고 있다.
+Refund Responsibility Optimization 이후 `orchestrator.py`를 다시 확인한 결과, Orchestrator가 질문 유형에 따라 기능을 선택하는 역할뿐만 아니라 각 기능의 세부 Multi-turn 처리까지 직접 담당하고 있었다.
 
-Optimization Baseline 기준으로
+Optimization 2 시작 시점의 구조는 다음과 같았다.
 
 ```text
 orchestrator.py
-2,681 lines
+2,707 lines
 
-중앙에서 직접 처리하는 Pending Action
-14개
+Orchestrator가 직접 처리하는 Pending Action
+13개
 ```
 
-였다.
-
-Refund Responsibility Optimization 과정에서도
-공통 Service 연결을 명시적으로 처리하면서
-현재 Line 수는 2,707 Line으로 증가하였다.
-
-따라서 다음 단계에서는 단순 Line 감소가 아니라
+예를 들어 배송지 변경 기능에서는 Orchestrator가 다음 과정을 모두 직접 처리하고 있었다.
 
 ```text
-중앙 Orchestrator
-→ 어떤 기능을 실행할지 결정
-
-각 기능별 Handler
-→ 해당 기능의 세부 처리 담당
+배송지 변경 최초 요청 Routing
+→ 변경할 주문 선택
+→ 새로운 배송지 입력
+→ 최종 승인
+→ Write Action 연결
 ```
 
-와 같이 역할을 나눌 수 있는지 검토한다.
+주문 취소 역시 다음 과정을 중앙 Orchestrator가 직접 관리했다.
 
-이 과정에서도 기존 Routing,
-Multi-turn State,
-Write Action 안전 절차를 유지하며
-Before / After 기준으로 변경 효과를 측정한다.
+```text
+주문 취소 최초 요청 Routing
+→ 취소할 주문 선택
+→ 최종 승인
+→ Refund 사전 검증
+→ 주문 / 결제 취소
+→ Refund Service 연결
+```
+
+기능이 추가될수록 `handle_pending_state()`에 새로운 분기가 계속 추가되는 구조였기 때문에, 특정 기능을 수정할 때 중앙 Orchestrator의 넓은 범위를 함께 확인해야 했다.
+
+---
+
+## 2-2. 개선 기준
+
+이번 최적화에서는 Pending Action 자체를 없애는 것을 목표로 하지 않았다.
+
+Pending Action은 Multi-turn 대화를 유지하기 위해 필요한 State이므로 그대로 유지하되, **어떤 Component가 해당 State의 세부 처리를 책임지는지**를 변경하였다.
+
+목표 구조는 다음과 같이 정의하였다.
+
+```text
+Orchestrator
+→ 어떤 Feature Flow를 실행할지 선택
+
+Feature Flow
+→ 해당 기능의 Multi-turn 처리
+→ State 전환
+→ 필요한 Service 연결
+
+Service
+→ 실제 Business Logic 및 데이터 처리
+```
+
+따라서 Orchestrator의 핵심 책임은 기능의 세부 구현이 아니라 **전체 처리 흐름에서 적절한 Feature Flow를 선택하고 연결하는 것**으로 정리하였다.
+
+---
+
+## 2-3. Feature Flow Layer 도입
+
+기능별 Multi-turn 처리를 분리하기 위해 새로운 `flows` 계층을 추가하였다.
+
+```text
+app/
+├─ flows/
+│  ├─ delivery_address_flow.py
+│  └─ order_cancel_flow.py
+│
+└─ services/
+   └─ orchestrator.py
+```
+
+Service와 Flow의 역할은 다음 기준으로 구분하였다.
+
+```text
+Service
+→ 실제 데이터 조회 / 검증 / 변경
+
+Flow
+→ 하나의 기능 안에서
+   Service와 State를 순서대로 연결
+
+Orchestrator
+→ 어떤 Flow를 실행할지 결정
+```
+
+---
+
+## 2-4. 배송지 변경 Flow 분리
+
+배송지 변경 기능에서는 최초 요청과 다음 세 Pending Action을 `delivery_address_flow.py`로 이동하였다.
+
+```text
+delivery_address_change_selection
+collect_delivery_address
+confirm_delivery_address_change
+```
+
+### Before
+
+```text
+Orchestrator
+├─ 배송지 변경 요청 판단
+├─ 주문 선택
+├─ 주소 입력
+├─ 최종 승인
+└─ 배송지 변경 Action 연결
+```
+
+### Current
+
+```text
+Orchestrator
+↓
+delivery_address_flow
+├─ 최초 요청 처리
+├─ 주문 선택
+├─ 새 주소 수집
+├─ 최종 승인
+└─ Service / State 연결
+```
+
+기존 Orchestrator에 남아 있던 배송지 변경 응답 함수와 관련 unused import도 제거하였다.
+
+배송지 변경 관련 테스트 9개를 통과한 뒤 전체 Regression Test를 수행하여 기존 기능이 유지되는 것을 확인하였다.
+
+```text
+144 passed
+```
+
+---
+
+## 2-5. 주문 취소 Flow 분리
+
+두 번째로 주문 취소 기능을 `order_cancel_flow.py`로 분리하였다.
+
+이동한 Pending Action은 다음 두 개이다.
+
+```text
+order_cancel_selection
+confirm_cancel
+```
+
+주문 취소는 Refund와 연결되는 기능이므로, Optimization 1에서 정리한 Refund Service 책임 구조를 그대로 유지하였다.
+
+### Current
+
+```text
+Orchestrator
+↓
+order_cancel_flow
+├─ 최초 요청 처리
+├─ 주문 선택
+├─ 사용자 최종 승인
+├─ Refund 사전 검증
+├─ 주문 / 결제 취소 Action
+└─ Refund Service 연결
+```
+
+계좌이체 환불 과정에서 사용하는
+
+```text
+collect_refund_account
+```
+
+는 주문 취소 전용 State가 아니므로 `order_cancel_flow.py` 내부로 이동하지 않았다.
+
+주문 취소 Flow는 필요한 Refund Context만 State에 저장한 뒤 공통 Refund 처리 단계로 연결하도록 유지하였다.
+
+주문 취소 및 Refund 관련 Target Test는 다음과 같이 통과하였다.
+
+```text
+24 passed
+```
+
+이후 전체 Regression Test에서도 기존 기능이 유지되었다.
+
+```text
+144 passed
+```
+
+---
+
+## 2-6. 현재 정량 비교
+
+현재까지의 구조 변경 결과는 다음과 같다.
+
+| 측정 항목                          |     Before |    Current |     변화 |
+| ------------------------------ | ---------: | ---------: | -----: |
+| `orchestrator.py` Line 수       |      2,707 |      1,945 | 762 감소 |
+| Orchestrator 직접 Pending Action |         13 |          8 |   5 감소 |
+| 전체 Regression Test             | 144 passed | 144 passed |  기능 유지 |
+
+비율로 보면 다음과 같다.
+
+```text
+orchestrator.py Line 수
+2,707 → 1,945
+약 28.1% 감소
+
+Orchestrator 직접 Pending Action
+13 → 8
+약 38.5% 감소
+```
+
+단, 762 Line 감소 전체를 Feature Flow 분리만의 효과로 해석하지 않는다.
+
+이번 과정에서는 함께 발견된
+
+```text
+unreachable dead code
+중복 Response Builder
+unused import
+```
+
+도 정리하였다.
+
+따라서 Line 수 감소는 **Orchestrator Structure Optimization 과정 전체의 변화**로 기록한다.
+
+이번 최적화에서 더 중요한 구조 지표는 Orchestrator가 직접 처리해야 하는 Pending Action이
+
+```text
+13개 → 8개
+```
+
+로 감소했다는 점이다.
+
+---
+
+## 2-7. 현재 구조
+
+현재 구조는 다음과 같다.
+
+```text
+User Request
+      ↓
+  Orchestrator
+      ↓
+Feature 선택
+      │
+      ├─ delivery_address_flow
+      │    └─ Service / State
+      │
+      ├─ order_cancel_flow
+      │    └─ Service / Refund Service / State
+      │
+      └─ 아직 중앙에서 처리하는 기존 기능
+```
+
+배송지 변경과 주문 취소의 상세 Multi-turn 흐름은 각 Feature Flow가 담당하고, Orchestrator는 해당 Flow를 선택하여 호출하는 구조로 변경되었다.
+
+현재까지 전체 Regression Test는
+
+```text
+144 passed
+0 failed
+```
+
+를 유지하고 있다.
+
+따라서 현재 단계에서는 **기존 기능과 Write Action 안전 절차를 유지하면서 중앙 Orchestrator의 기능별 세부 처리 책임을 Feature Flow로 분리한 것**을 주요 개선 결과로 본다.

@@ -6,10 +6,6 @@ from app.services.order_payment_service import (
     check_payment_completion,
     generate_payment_response,
     check_order_payment_consistency,
-    check_order_cancel_eligibility,
-    cancel_order_action,
-    check_delivery_address_change_eligibility,
-    change_delivery_address,
     check_order_change,
     change_order_quantity,
 )
@@ -23,7 +19,6 @@ from app.services.state_service import (
     extract_order_id,
     extract_confirmation,
     extract_refund_account,
-    extract_delivery_address,
     extract_quantity_change_request,
 )
 
@@ -53,6 +48,27 @@ from app.services.refund_service import (
     start_refund,
     register_refund_account as register_refund_account_common,
 )
+
+from app.flows.delivery_address_flow import (
+    start_delivery_address_flow,
+)
+
+from app.flows.delivery_address_flow import (
+    start_delivery_address_flow,
+    handle_delivery_address_pending,
+)
+
+from app.flows.order_cancel_flow import (
+    start_order_cancel_flow,
+)
+
+from app.flows.order_cancel_flow import (
+    start_order_cancel_flow,
+    handle_order_cancel_pending,
+)
+
+
+
 
 
 # =========================================================
@@ -394,230 +410,6 @@ def build_order_delivery_eta_response(
     )
 
 # =========================================================
-# 3. 주문 취소 가능 여부 결과 → 사용자 응답
-# =========================================================
-
-def build_order_cancel_pre_action_response(result: dict) -> str:
-    """
-    실제 주문 취소 Action을 실행하기 전 단계의 응답을 생성한다.
-
-    - 주문 조회 실패
-    - 주문 선택 필요
-    - 취소 가능 → 최종 승인 요청
-    - 취소 불가
-    - 이미 취소됨
-
-    을 처리한다.
-    """
-
-    result_type = result["result_type"]
-
-    # 주문을 찾지 못한 경우
-    if result_type == "not_found":
-        return (
-            "취소할 주문을 확인할 수 없습니다. "
-            "주문번호를 다시 확인해주세요."
-        )
-
-    # 주문이 여러 건이라 선택이 필요한 경우
-    if result_type == "need_order_selection":
-        candidate_orders = result["candidate_orders"]
-
-        order_list = "\n".join(
-            f"- 주문번호 {order['order_id']} / "
-            f"{order['order_date']} / "
-            f"{order['total_price']:,}원"
-            for order in candidate_orders
-        )
-
-        return (
-            "취소 가능한 주문을 확인하기 위해 "
-            "취소할 주문을 선택해주세요.\n\n"
-            f"{order_list}"
-        )
-
-    # 정상 조회가 아닌 예상하지 못한 결과
-    if result_type != "success":
-        return "주문 취소 가능 여부를 확인하는 중 문제가 발생했습니다."
-
-    cancel_judgment = result["cancel_judgment"]
-    reason = result["reason"]
-    order_id = result["order_id"]
-
-    # 취소 가능 → 아직 Action 실행 X
-    if cancel_judgment == "cancelable":
-        return (
-            f"주문번호 {order_id}번 주문을 취소하시겠어요? "
-            "(예/아니오)"
-        )
-
-    # 이미 취소된 주문
-    if cancel_judgment == "already_canceled":
-        return "이미 정상적으로 주문이 취소되었습니다."
-
-    # 배송중
-    if (
-        cancel_judgment == "not_cancelable"
-        and reason == "in_transit"
-    ):
-        return (
-            "현재 배송 중인 주문은 취소가 어렵습니다. "
-            "상품을 수령하신 후 취소를 원하시는 경우에는 "
-            "교환/환불 카테고리로 문의해 주세요."
-        )
-
-    # 배송완료
-    if (
-        cancel_judgment == "not_cancelable"
-        and reason == "delivered"
-    ):
-        return (
-            "배송이 이미 완료되어 현재 주문 취소는 어렵습니다. "
-            "배송 완료된 주문에 대해 취소를 원하시는 경우에는 "
-            "교환/환불 카테고리로 문의해 주세요."
-        )
-
-    # 주문 실패
-    if (
-        cancel_judgment == "not_cancelable"
-        and reason == "order_failed"
-    ):
-        return (
-            "정상적으로 완료되지 않은 주문으로 "
-            "주문 취소를 진행할 수 없습니다."
-        )
-
-    # 정의하지 않은 상태
-    return (
-        "현재 주문 상태만으로 취소 가능 여부를 확인하기 어렵습니다. "
-        "추가 확인이 필요합니다."
-    )
-
-
-# =========================================================
-# 4. 주문 취소 Action 결과 → 사용자 응답
-# =========================================================
-
-def build_order_cancel_action_response(result: dict) -> str:
-    """
-    실제 주문 취소 Action 실행 후 결과에 따라
-    사용자에게 안내할 응답을 생성한다.
-    """
-
-    result_type = result["result_type"]
-
-    # 카드 결제 취소
-    if (
-        result_type == "success"
-        and result.get("payment_method") == "card"
-    ):
-        return (
-            "주문이 정상적으로 취소되었습니다. "
-            "카드 결제 취소는 카드사를 통해 처리되며, "
-            "환불 완료까지 영업일 기준 7일 정도 소요될 수 있습니다."
-        )
-
-    # 계좌이체 결제 취소
-    if result_type == "refund_account_required":
-        return (
-            "주문이 정상적으로 취소되었습니다. "
-            "환불을 위해 환불받으실 계좌 정보를 입력해 주세요."
-        )
-
-    # Action 실패
-    if result_type == "action_failed":
-        return (
-            "주문 취소 처리 중 문제가 발생했습니다. "
-            "현재 주문 상태를 다시 확인해 주세요."
-        )
-
-    return "주문 취소 처리 결과를 확인하는 중 문제가 발생했습니다."
-
-
-# =========================================================
-# 배송지 변경 가능 여부 결과 → 사용자 응답
-# =========================================================
-
-def build_delivery_address_change_response(result: dict) -> str:
-
-    result_type = result["result_type"]
-
-    # 주문을 찾지 못한 경우
-    if result_type == "not_found":
-        return (
-            "배송지를 변경할 주문을 확인할 수 없습니다. "
-            "주문번호를 다시 확인해 주세요."
-        )
-
-    # 여러 주문 중 선택이 필요한 경우
-    if result_type == "need_order_selection":
-        candidate_orders = result["candidate_orders"]
-
-        order_list = "\n".join(
-            f"- 주문번호 {order['order_id']} / "
-            f"{order['order_date']} / "
-            f"{order['total_price']:,}원 / "
-            f"{order['delivery_address']}"
-            for order in candidate_orders
-        )
-
-        return (
-            "배송지를 변경할 주문을 선택해 주세요.\n\n"
-            f"{order_list}"
-        )
-
-    if result_type != "success":
-        return "배송지 변경 가능 여부를 확인하는 중 문제가 발생했습니다."
-
-    judgment = result["address_change_judgment"]
-    reason = result["reason"]
-
-    # 배송지 변경 가능
-    if judgment == "changeable":
-        return "변경할 새로운 배송지를 입력해 주세요."
-
-    if (
-        judgment == "not_changeable"
-        and reason == "in_transit"
-    ):
-        return (
-            "이미 배송이 시작된 주문은 "
-            "배송지를 변경할 수 없습니다."
-        )
-
-    if (
-        judgment == "not_changeable"
-        and reason == "delivered"
-    ):
-        return (
-            "이미 배송이 완료된 주문은 "
-            "배송지를 변경할 수 없습니다."
-        )
-
-    if (
-        judgment == "not_changeable"
-        and reason == "order_canceled"
-    ):
-        return (
-            "이미 취소된 주문은 "
-            "배송지를 변경할 수 없습니다."
-        )
-
-    if (
-        judgment == "not_changeable"
-        and reason == "order_failed"
-    ):
-        return (
-            "정상적으로 완료되지 않은 주문은 "
-            "배송지를 변경할 수 없습니다."
-        )
-
-    return (
-        "현재 주문 상태만으로 배송지 변경 가능 여부를 "
-        "확인하기 어렵습니다. 추가 확인이 필요합니다."
-    )
-
-# =========================================================
 # 결제수단 변경 Policy 결과 → 사용자 응답
 # =========================================================
 
@@ -839,471 +631,28 @@ def handle_pending_state(
     if state["pending_action"] is None:
         return None
 
-    # -----------------------------------------------------
-    # 배송지 변경 - 새 주소 입력
-    # -----------------------------------------------------
 
-    if state["pending_action"] == "collect_delivery_address":
-
-        selected_order_id = state["selected_order_id"]
-
-        # 어떤 주문의 배송지를 변경하는지 확인할 수 없는 경우
-        if selected_order_id is None:
-            reset_state(state)
-
-            return {
-                "route": "delivery_address_change",
-                "result": {
-                    "result_type": "action_failed",
-                    "reason": "selected_order_not_found",
-                },
-                "response": (
-                    "배송지를 변경할 주문 정보를 확인할 수 없습니다. "
-                    "주문번호를 다시 입력해 주세요."
-                ),
-            }
-
-        # 현재 고객의 해당 주문 확인
-        selected_order = next(
-            (
-                order
-                for order in orders
-                if order["customer_id"] == customer_id
-                and order["order_id"] == selected_order_id
-            ),
-            None,
-        )
-
-        if selected_order is None:
-            reset_state(state)
-
-            return {
-                "route": "delivery_address_change",
-                "result": {
-                    "result_type": "action_failed",
-                    "reason": "order_not_found",
-                },
-                "response": (
-                    "배송지를 변경할 주문을 확인할 수 없습니다. "
-                    "주문번호를 다시 확인해 주세요."
-                ),
-            }
-
-        # 사용자가 입력한 새 배송지 추출
-        new_delivery_address = extract_delivery_address(
-            user_input
-        )
-
-        # 주소가 비어 있는 경우
-        if new_delivery_address is None:
-            return {
-                "route": "delivery_address_change",
-                "result": None,
-                "response": "변경할 새로운 배송지를 입력해 주세요.",
-            }
-
-        # 새 주소는 실제 주문에 반영하지 않고 State에만 저장
-
-        state["pending_data"]["new_delivery_address"] = (
-            new_delivery_address
-        )
-
-        state["pending_action"] = (
-            "confirm_delivery_address_change"
-        )
-
-        current_delivery_address = (
-            selected_order["delivery_address"]
-        )
-
-        return {
-            "route": "delivery_address_change",
-            "result": {
-                "result_type": "confirmation_required",
-                "order_id": selected_order_id,
-                "current_delivery_address": (
-                    current_delivery_address
-                ),
-                "new_delivery_address": (
-                    new_delivery_address
-                ),
-            },
-            "response": (
-                f"현재 배송지: {current_delivery_address}\n"
-                f"변경 배송지: {new_delivery_address}\n\n"
-                "이 배송지로 변경하시겠어요? (예/아니오)"
-            ),
-        }
-
-    # -----------------------------------------------------
-    # 배송지 변경 - 최종 승인
-    # -----------------------------------------------------
-
-    if state["pending_action"] == "confirm_delivery_address_change":
-
-        selected_order_id = state["selected_order_id"]
-
-        new_delivery_address = state["pending_data"].get(
-            "new_delivery_address"
-        )
-
-        # 어떤 주문인지 확인할 수 없는 경우
-        if selected_order_id is None:
-            reset_state(state)
-
-            return {
-                "route": "delivery_address_change",
-                "result": {
-                    "result_type": "action_failed",
-                    "reason": "selected_order_not_found",
-                },
-                "response": (
-                    "배송지를 변경할 주문 정보를 확인할 수 없습니다. "
-                    "주문번호를 다시 입력해 주세요."
-                ),
-            }
-
-        # 새 배송지 정보가 State에 없는 경우
-        if new_delivery_address is None:
-            reset_state(state)
-
-            return {
-                "route": "delivery_address_change",
-                "result": {
-                    "result_type": "action_failed",
-                    "reason": "delivery_address_not_found",
-                },
-                "response": (
-                    "변경할 배송지 정보를 확인할 수 없습니다. "
-                    "배송지 변경을 다시 요청해 주세요."
-                ),
-            }
-
-        # 사용자 최종 승인 여부 확인
-
-        confirmation = extract_confirmation(user_input)
-
-        # 승인/거절이 불명확
-        if confirmation is None:
-            return {
-                "route": "delivery_address_change",
-                "result": None,
-                "response": (
-                    f"배송지를 '{new_delivery_address}'로 "
-                    "변경하시려면 '예', 변경하지 않으시려면 "
-                    "'아니오'라고 입력해 주세요."
-                ),
-            }
-
-        # 사용자가 변경을 거절
-
-        if confirmation is False:
-            reset_state(state)
-
-            return {
-                "route": "delivery_address_change",
-                "result": {
-                    "result_type": "change_aborted",
-                    "order_id": selected_order_id,
-                },
-                "response": "배송지 변경을 진행하지 않았습니다.",
-            }
-
-        # 사용자가 명확하게 승인
-        # 여기서만 Write Action 실행
-
-        result = change_delivery_address(
-            orders=orders,
-            customer_id=customer_id,
-            order_id=selected_order_id,
-            new_delivery_address=new_delivery_address,
-        )
-
-        # Action 성공
-        if result["result_type"] == "success":
-
-            reset_state(state)
-
-            return {
-                "route": "delivery_address_change",
-                "result": result,
-                "response": (
-                    "배송지가 정상적으로 변경되었습니다.\n\n"
-                    f"- 이전 배송지: "
-                    f"{result['previous_delivery_address']}\n"
-                    f"- 변경 배송지: "
-                    f"{result['new_delivery_address']}"
-                ),
-            }
-
-        # Action 실패
-        reset_state(state)
-
-        return {
-            "route": "delivery_address_change",
-            "result": result,
-            "response": (
-                "배송지 변경을 처리하지 못했습니다. "
-                "현재 주문 상태를 다시 확인해 주세요."
-            ),
-        }
-    
-    # -----------------------------------------------------
-    # 배송지 변경 - 주문 선택
-    # -----------------------------------------------------
-
-    if state["pending_action"] == "delivery_address_change_selection":
-
-        selected_order_id = extract_order_id(user_input)
-
-        # 주문번호를 확인할 수 없는 경우
-        if selected_order_id is None:
-            return {
-                "route": "delivery_address_change",
-                "result": None,
-                "response": (
-                    "배송지를 변경할 주문번호를 입력해 주세요."
-                ),
-            }
-
-        # 사용자가 선택할 수 있는 주문인지 확인
-        candidate_order_ids = {
-            order["order_id"]
-            for order in state["candidate_orders"]
-        }
-
-        if selected_order_id not in candidate_order_ids:
-            return {
-                "route": "delivery_address_change",
-                "result": None,
-                "response": (
-                    "선택 가능한 주문번호가 아닙니다. "
-                    "안내된 주문번호 중에서 선택해 주세요."
-                ),
-            }
-
-        # 선택한 주문의 배송지 변경 가능 여부 재확인
-        result = check_delivery_address_change_eligibility(
-            orders=orders,
-            customer_id=customer_id,
-            order_id=selected_order_id,
-        )
-
-        # 배송지 변경 가능
-        if (
-            result["result_type"] == "success"
-            and result["address_change_judgment"] == "changeable"
-        ):
-            state["pending_action"] = "collect_delivery_address"
-            state["candidate_orders"] = []
-            state["selected_order_id"] = selected_order_id
-            state["pending_data"] = {}
-
-        # 변경할 수 없는 주문이거나 조회에 문제가 있는 경우
-        else:
-            reset_state(state)
-
-        response = build_delivery_address_change_response(result)
-
-        return {
-            "route": "delivery_address_change",
-            "result": result,
-            "response": response,
-        }
-    
-    # -----------------------------------------------------
-    # 주문 취소 최종 승인
-    # -----------------------------------------------------
-
-    if state["pending_action"] == "confirm_cancel":
-
-        selected_order_id = state["selected_order_id"]
-
-        # 어떤 주문에 대한 승인인지 확인할 수 없는 경우
-        if selected_order_id is None:
-            reset_state(state)
-
-            return {
-                "route": "order_cancel",
-                "result": {
-                    "result_type": "action_failed",
-                    "reason": "selected_order_not_found",
-                },
-                "response": (
-                    "취소할 주문 정보를 확인할 수 없습니다. "
-                    "주문번호를 다시 입력해 주세요."
-                ),
-            }
-
-        confirmation = extract_confirmation(user_input)
-
-        # 승인/거절 여부가 명확하지 않은 경우
-        if confirmation is None:
-            return {
-                "route": "order_cancel",
-                "result": None,
-                "response": (
-                    f"주문번호 {selected_order_id}번 주문 취소를 "
-                    "진행하시려면 '예', 취소하지 않으시려면 "
-                    "'아니오'라고 입력해 주세요."
-                ),
-            }
-
-        # 사용자가 취소를 거절한 경우
-        if confirmation is False:
-            reset_state(state)
-
-            return {
-                "route": "order_cancel",
-                "result": {
-                    "result_type": "cancel_aborted",
-                    "order_id": selected_order_id,
-                },
-                "response": "주문 취소를 진행하지 않았습니다.",
-            }
-
-        # -------------------------------------------------
-        # 사용자가 명확하게 승인한 경우
-        # 여기에서만 실제 Write Flow 실행
-        # -------------------------------------------------
-
-        if payments is None:
-            payments = []
-
-        if refunds is None:
-            refunds = []
-
-        # 1. Refund 사전 검증
-        #
-        # 주문/결제 데이터를 먼저 취소한 뒤
-        # 환불 불가능 상태를 발견하는 것을 방지한다.
-
-        refund_validation = validate_refund_request(
-            payments=payments,
-            order_id=selected_order_id,
-            refund_type="full",
-            refund_amount=None,
-        )
-
-        if refund_validation["result_type"] != "success":
-            reset_state(state)
-
-            return {
-                "route": "order_cancel",
-                "result": refund_validation,
-                "response": (
-                    "주문 취소에 필요한 환불 정보를 확인하지 못했습니다. "
-                    "현재 결제 상태를 다시 확인해 주세요."
-                ),
-            }
-
-        # 2. 주문 / 결제 취소 Action
-        #
-        # Refund 생성은 이 함수가 담당하지 않는다.
-
-        cancel_result = cancel_order_action(
-            orders=orders,
-            payments=payments,
-            customer_id=customer_id,
-            order_id=selected_order_id,
-        )
-
-        if cancel_result["result_type"] != "success":
-            reset_state(state)
-
-            return {
-                "route": "order_cancel",
-                "result": cancel_result,
-                "response": build_order_cancel_action_response(
-                    cancel_result
-                ),
-            }
-
-        # 3. 공통 Refund Service 연결
-
-        refund_result = start_refund(
-            payments=payments,
-            refunds=refunds,
-            order_id=selected_order_id,
-            refund_amount=None,
-            refund_type="full",
-            refund_reason="order_cancel",
-        )
-
-        # 4. Refund 시작 실패
-        #
-        # 이 시점에는 주문/결제 취소 Action은 이미 완료되었다.
-        # 따라서 전체 취소가 실패했다고 표현하지 않는다.
-
-        if refund_result["result_type"] == "action_failed":
-            reset_state(state)
-
-            return {
-                "route": "order_cancel",
-                "result": {
-                    "order_cancel": cancel_result,
-                    "refund": refund_result,
-                },
-                "response": (
-                    "주문과 결제는 취소되었지만 "
-                    "환불 절차를 시작하는 중 문제가 발생했습니다. "
-                    "환불 상태를 추가로 확인해 주세요."
-                ),
-            }
-
-        # 5. 기존 Response Interface 유지
-        #
-        # 기존 테스트와 외부 Flow에 불필요한 영향을 주지 않도록
-        # Order Cancel 결과와 Refund 결과를 하나의 결과로 조합한다.
-
-        result = {
-            **cancel_result,
-            **refund_result,
-        }
-
-        response = build_order_cancel_action_response(result)
-
-        # 6. 계좌이체 → 환불계좌 입력 필요
-
-        if result["result_type"] == "refund_account_required":
-            state["pending_action"] = "collect_refund_account"
-            state["candidate_orders"] = []
-            state["selected_order_id"] = selected_order_id
-
-            # 다음 단계에서 공통 Refund State로 통합하기 위해
-            # 현재 Refund Context도 저장한다.
-            state["pending_data"] = {
-                "refund_id": result["refund_id"],
-                "refund_amount": result["refund_amount"],
-                "refund_type": "full",
-                "source": "order_cancel",
-            }
-
-        # 카드 Refund 시작 성공
-        else:
-            reset_state(state)
-
-        return {
-            "route": "order_cancel",
-            "result": result,
-            "response": response,
-        }
-
-        # 계좌이체라 환불계좌가 필요한 경우
-        if result["result_type"] == "refund_account_required":
-            state["pending_action"] = "collect_refund_account"
-            state["candidate_orders"] = []
-            state["selected_order_id"] = selected_order_id
-
-        # 카드 취소 성공 또는 Action 실패
-        else:
-            reset_state(state)
-
-        return {
-            "route": "order_cancel",
-            "result": result,
-            "response": response,
-        }
+    delivery_address_result = handle_delivery_address_pending(
+    user_input=user_input,
+    customer_id=customer_id,
+    orders=orders,
+    state=state,
+    )
+
+    if delivery_address_result is not None:
+        return delivery_address_result
+
+    order_cancel_result = handle_order_cancel_pending(
+        user_input=user_input,
+        customer_id=customer_id,
+        orders=orders,
+        state=state,
+        payments=payments,
+        refunds=refunds,
+    )
+
+    if order_cancel_result is not None:
+        return order_cancel_result
 
     # -----------------------------------------------------
     # 공통 환불계좌 정보 입력
@@ -1415,66 +764,6 @@ def handle_pending_state(
                 "환불계좌를 등록하는 중 문제가 발생했습니다. "
                 "환불 상태를 다시 확인해 주세요."
             ),
-        }
-
-
-    # -----------------------------------------------------
-    # 주문 취소할 주문 선택
-    # -----------------------------------------------------
-
-    if state["pending_action"] == "order_cancel_selection":
-
-        selected_order_id = extract_order_id(user_input)
-
-        # 주문번호를 찾지 못한 경우
-        if selected_order_id is None:
-            return {
-                "route": "order_cancel",
-                "result": None,
-                "response": "취소할 주문번호를 입력해주세요.",
-            }
-
-        candidate_order_ids = [
-            order["order_id"]
-            for order in state["candidate_orders"]
-        ]
-
-        # 후보에 없는 주문번호를 선택한 경우
-        if selected_order_id not in candidate_order_ids:
-            return {
-                "route": "order_cancel",
-                "result": None,
-                "response": (
-                    "선택 가능한 주문번호 중에서 "
-                    "다시 선택해주세요."
-                ),
-            }
-
-        result = check_order_cancel_eligibility(
-            orders=orders,
-            customer_id=customer_id,
-            order_id=selected_order_id,
-        )
-
-        # 취소 가능한 주문이면 최종 승인 State로 이동
-        if (
-            result["result_type"] == "success"
-            and result["cancel_judgment"] == "cancelable"
-        ):
-            state["pending_action"] = "confirm_cancel"
-            state["candidate_orders"] = []
-            state["selected_order_id"] = selected_order_id
-
-        # 취소 불가능하거나 이미 취소된 경우 작업 종료
-        else:
-            reset_state(state)
-
-        response = build_order_cancel_pre_action_response(result)
-
-        return {
-            "route": "order_cancel",
-            "result": result,
-            "response": response,
         }
 
     # -----------------------------------------------------
@@ -2402,78 +1691,27 @@ def route_request(
         and request.cs_category == "order_payment"
         and request.sub_intent == "order_cancel"
     ):
-
-        result = check_order_cancel_eligibility(
-            orders=orders,
+        return start_order_cancel_flow(
+            request=request,
             customer_id=customer_id,
-            order_id=request.order_id,
+            orders=orders,
+            state=state,
         )
-
-        # 주문번호가 없고 주문이 여러 건인 경우
-        if result["result_type"] == "need_order_selection":
-            state["pending_action"] = "order_cancel_selection"
-            state["candidate_orders"] = result["candidate_orders"]
-            state["selected_order_id"] = None
-
-        # 주문을 찾았고 취소 가능한 경우
-        elif (
-            result["result_type"] == "success"
-            and result["cancel_judgment"] == "cancelable"
-        ):
-            state["pending_action"] = "confirm_cancel"
-            state["candidate_orders"] = []
-            state["selected_order_id"] = result["order_id"]
-
-        response = build_order_cancel_pre_action_response(result)
-
-        return {
-            "route": "order_cancel",
-            "request": request.model_dump(),
-            "result": result,
-            "response": response,
-        }
-
     # -----------------------------------------------------
     # 6) 배송지 변경
     # -----------------------------------------------------
 
     if (
-    request.intent == "cs"
-    and request.cs_category == "order_payment"
-    and request.sub_intent == "delivery_address_change"
+        request.intent == "cs"
+        and request.cs_category == "order_payment"
+        and request.sub_intent == "delivery_address_change"
     ):
-
-        result = check_delivery_address_change_eligibility(
-            orders=orders,
+        return start_delivery_address_flow(
+            request=request,
             customer_id=customer_id,
-            order_id=request.order_id,
+            orders=orders,
+            state=state,
         )
-
-        # 주문을 여러 건 보유하여 선택이 필요한 경우
-        if result["result_type"] == "need_order_selection":
-            state["pending_action"] = "delivery_address_change_selection"
-            state["candidate_orders"] = result["candidate_orders"]
-            state["selected_order_id"] = None
-            state["pending_data"] = {}
-
-        # 주문이 특정되었고 배송지 변경이 가능한 경우
-        elif (
-            result["result_type"] == "success"
-            and result["address_change_judgment"] == "changeable"
-        ):
-            state["pending_action"] = "collect_delivery_address"
-            state["candidate_orders"] = []
-            state["selected_order_id"] = result["order_id"]
-            state["pending_data"] = {}
-
-        response = build_delivery_address_change_response(result)
-
-        return {
-            "route": "delivery_address_change",
-            "request": request.model_dump(),
-            "result": result,
-            "response": response,
-        }
 
     # =====================================================
     # 7) 결제수단 변경
