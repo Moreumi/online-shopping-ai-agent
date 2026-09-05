@@ -1,9 +1,5 @@
 from app.services.order_payment_service import (
     check_order_cancel_eligibility,
-)
-
-from app.services.order_payment_service import (
-    check_order_cancel_eligibility,
     cancel_order_action,
 )
 
@@ -17,18 +13,6 @@ from app.services.state_service import (
     extract_confirmation,
     reset_state,
 )
-
-from app.services.refund_service import (
-    validate_refund_request,
-    start_refund,
-)
-
-from app.services.state_service import (
-    extract_order_id,
-    extract_confirmation,
-    reset_state,
-)
-
 
 #----------------------------------------#
 
