@@ -242,28 +242,9 @@ def start_order_change_flow(
             "adjustment_type": calculation["adjustment_type"],
             "adjustment_amount": calculation["adjustment_amount"],
         }
-    elif result["result_type"] == "change_preview":
-        calculation = result["calculation"]
-
-        state["pending_action"] = "order_change_confirmation"
-        state["candidate_orders"] = []
-        state["selected_order_id"] = result["order_id"]
-
-        state["pending_data"] = {
-            "target_quantity": calculation["target_quantity"],
-            "current_quantity": calculation["current_quantity"],
-            "current_total_price": calculation["current_total_price"],
-            "new_total_price": calculation["new_total_price"],
-            "adjustment_type": calculation["adjustment_type"],
-            "adjustment_amount": calculation["adjustment_amount"],
-        }
 
     else:
         reset_state(state)
-
-    response = build_order_change_response(result)
-
-
 
     response = build_order_change_response(result)
 
@@ -273,6 +254,8 @@ def start_order_change_flow(
         "result": result,
         "response": response,
     }
+
+
 def handle_order_change_pending(
     user_input: str,
     customer_id: int,
@@ -282,7 +265,8 @@ def handle_order_change_pending(
     refunds: list[dict] | None = None,
     payment_adjustments: list[dict] | None = None,
 ) -> dict | None:
- # -----------------------------------------------------
+
+    # -----------------------------------------------------
     # 주문 수량 변경 - 주문 선택
     # -----------------------------------------------------
 
