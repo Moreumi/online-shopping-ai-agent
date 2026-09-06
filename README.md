@@ -1,9 +1,11 @@
 # Online Shopping Mall AI Agent
 
-온라인 쇼핑몰에서 고객의 문의를 이해하고,  
-CS 응대와 상품 추천을 처리할 수 있는 AI Agent를 개발하는 프로젝트입니다.
+온라인 쇼핑몰에서 고객 문의를 이해하고, CS 응대와 상품 추천으로 연결할 수 있는 AI Agent의 전체 처리 흐름을 설계·구현하는 프로젝트입니다.
 
-현재는 CS 기능 중 **주문 완료 확인 / 결제 완료 확인 / 결제수단 변경 / 주문 취소 / 주문 수량 변경 / 배송지 변경 / 배송 상태 확인 / 배송 예상 시기 안내**를 중심으로 구현하고 있습니다.
+현재 CS 영역에서는 **주문 완료 확인 / 결제 완료 확인 / 결제수단 변경 / 주문 취소 / 주문 수량 변경 / 배송지 변경 / 배송 상태 확인 / 배송 예상 시기 안내**를 구현했습니다.
+
+사용자 입력 이후 **Intent 판단 → Routing → State 관리 → Policy 판단 → Service 호출 → Write Action → 최종 응답**까지의 End-to-End 흐름을 연결했으며, 기능 구현 이후에는 Refund 책임 통합과 Feature Flow 분리를 통해 Orchestrator 구조를 개선했습니다.
+
 
 ---
 
@@ -262,73 +264,209 @@ State에 후보 주문을 저장한 뒤 사용자에게 주문번호를 추가�
 임의로 추정하지 않습니다.
 
 ## 4. Current Architecture
+
+현재 구조는 Orchestrator가 모든 Multi-turn 세부 로직을 직접 처리하지 않고, 복잡한 기능은 Feature Flow에 위임하도록 구성되어 있습니다.
+
 ```text
 User
 ↓
 FastAPI Router
 ↓
 Orchestrator
-↓
-Pending State 확인
-│
-├─ 진행 중인 State 존재
-│   → 기존 Multi-turn Flow 계속 처리
-│
-└─ 진행 중인 State 없음
-    ↓
-    Intent Classification
-    ↓
-    Routing
-    ├─ Read Flow
+├─ 진행 중인 대화 흐름 확인
+├─ Intent Classification
+├─ Routing
+└─ 실행할 Feature / Handler 선택
+    │
+    ├─ Read / Guidance Flow
     │   ├─ order_confirmation
     │   ├─ payment_confirmation
-    │   └─ delivery_status
+    │   ├─ payment_method_change
+    │   ├─ delivery_status
+    │   └─ delivery_eta
     │
-    ├─ Guidance Flow
-    │   └─ payment_method_change
-    │       → Policy
-    │       → Guidance Response
-    │       → Flow 종료
-    ├─ Read + Policy Flow
-    │   └─ delivery_eta (order_specific)
-    │       → 주문 조회 / 선택
-    │       → Delivery Status 조회
-    │       → Delivery ETA Policy
-    │       → Contextual Response
-    │
-    └─ Write Flow
-        ├─ order_cancel
-        ├─ delivery_address_change
-        └─ order_change
-            → 주문 / 결제 조회
-            → Order Change Policy
-            → 수량 / 금액 / 결제 차액 계산
-            → Preview
-            → 사용자 최종 승인
-            → Action-time Recheck
-            → Order Write
-            → Payment Adjustment
+    └─ Feature Flow
+        ├─ Delivery Address Flow
+        ├─ Order Cancel Flow
+        └─ Order Change Flow
+             ↓
+           Service
+             ↓
+           Policy / Validation
+             ↓
+           Data Action
+             ↓
+           Response
 ```
-### 역할 분리
 
-**Service / Data**
-- 고객의 실제 주문·결제 데이터 조회
+복잡한 Write 기능은 별도의 Feature Flow에서 Multi-turn State와 세부 진행 순서를 관리합니다.
 
-**Policy**
-- 조회된 상태값의 업무적 의미 판정
+```text
+Orchestrator
+→ 어떤 기능을 실행할지 결정
 
-**Consistency Policy**
-- 주문 상태와 결제 상태 간 불일치 검증
+Feature Flow
+→ 기능 내부의 Multi-turn State 전이
+→ 사용자 추가 입력 수집
+→ 최종 승인 확인
+→ Service 호출 순서 관리
+→ 다른 공통 Flow로의 연결
+
+Service
+→ 주문·결제·환불 등 실제 데이터 조회 및 변경
+
+Policy
+→ 현재 상태를 기준으로 업무 가능 여부 판단
+
+LLM
+→ Intent 분류 및 확정된 결과의 자연어 표현
+```
+
+### Feature Flow Layer
+
+현재 다음과 같은 복잡한 Multi-turn 기능을 Feature Flow로 분리했습니다.
+
+```text
+app/flows/
+├─ delivery_address_flow.py
+├─ order_cancel_flow.py
+└─ order_change_flow.py
+```
+
+예를 들어 주문 수량 변경은 다음 과정을 하나의 Feature Flow가 관리합니다.
+
+```text
+Order Change 요청
+↓
+주문 선택 필요 여부 확인
+↓
+수량 입력 필요 여부 확인
+↓
+변경 Preview 생성
+↓
+사용자 최종 승인
+↓
+주문 변경 Write Action
+↓
+추가 결제 / 부분 환불 분기
+↓
+필요 시 공통 Refund Flow 연결
+```
+
+환불계좌 입력인 `collect_refund_account`는 주문 취소와 주문 수량 변경에서 함께 사용되므로 특정 Feature Flow에 종속시키지 않고 공통 Refund State로 유지했습니다.
+
+### 역할 분리 기준
 
 **Orchestrator**
-- 다음 처리 단계와 응답 방식을 결정
 
-**Output LLM**
-- 확정된 사실과 Policy를 고객이 이해하기 쉬운 자연어로 표현
+* Intent와 현재 State를 기준으로 실행할 기능을 결정
+* Feature Flow 또는 공통 Handler로 요청 전달
+* 전체 기능 간 연결 책임 담당
 
-LLM은 주문 상태나 쇼핑몰 Policy 자체를 임의로 판단하지 않습니다.
+**Feature Flow**
 
----
+* 특정 기능의 Multi-turn 진행 과정 관리
+* State 전이 및 추가 입력 처리
+* 사용자 승인과 Write Action 사이의 실행 순서 관리
+
+**Service / Data**
+
+* 고객·주문·결제·배송·환불 데이터 조회
+* 실제 Write Action 수행
+
+**Policy**
+
+* 조회된 상태값을 기준으로 업무 가능 여부 판단
+
+**Consistency Policy**
+
+* 주문·결제 등 서로 연결된 데이터의 상태 불일치 검증
+
+**LLM**
+
+* 사용자 Intent 및 필요한 조건 추출
+* 확정된 사실과 Policy 결과를 자연어로 표현
+
+업무 가능 여부와 실제 상태 변경은 LLM이 임의로 결정하지 않으며, Python 기반 Policy와 Service 결과를 기준으로 처리합니다.
+
+### Architecture Optimization
+
+기능 구현 이후 Orchestrator에 Multi-turn State 처리와 세부 Business Flow가 집중되어 있어, 기능 추가·수정 시 하나의 파일에서 확인해야 하는 범위가 커지는 문제를 발견했습니다.
+
+이를 두 단계로 개선했습니다.
+
+#### 1. Refund Responsibility 통합
+
+주문 취소와 주문 수량 감소에서 각각 구현되어 있던 Refund 처리를 공통 `refund_service.py`로 통합했습니다.
+
+```text
+Before
+Order Cancel ─→ 자체 Refund 처리
+Order Change ─→ 별도 Refund 처리
+
+After
+Order Cancel ─┐
+              ├─→ Refund Service
+Order Change ─┘
+```
+
+| 항목                | Before | After |
+| ----------------- | -----: | ----: |
+| Refund 생성 구현 위치   |      2 |     1 |
+| 환불계좌 등록 구현 위치     |      2 |     1 |
+| card / cash 분기 위치 |      2 |     1 |
+| 환불계좌 입력 State     |      2 |     1 |
+
+#### 2. Orchestrator 책임 분리
+
+Orchestrator가 직접 관리하던 복잡한 Multi-turn Flow를 Feature Flow Layer로 분리했습니다.
+
+```text
+Before
+
+Orchestrator
+├─ Routing
+├─ Delivery Address 상세 Flow
+├─ Order Cancel 상세 Flow
+├─ Order Change 상세 Flow
+└─ Pending State 처리
+
+
+After
+
+Orchestrator
+→ Feature 선택 / 연결
+
+Feature Flow
+→ Multi-turn State / 업무 흐름
+
+Service
+→ 실제 데이터 Action
+```
+
+분리한 Feature Flow:
+
+* `delivery_address_flow.py`
+* `order_cancel_flow.py`
+* `order_change_flow.py`
+
+최종 측정 결과:
+
+| 측정 항목                          |     Before |      After |
+| ------------------------------ | ---------: | ---------: |
+| `orchestrator.py` Line 수       |      2,707 |      1,194 |
+| Orchestrator 직접 Pending Action |         13 |          5 |
+| 전체 Regression Test             | 144 passed | 146 passed |
+
+`orchestrator.py`는 2,707줄에서 1,194줄로 약 **55.9% 감소**했습니다.
+
+단, 이 수치는 Feature Flow 분리뿐 아니라 리팩터링 과정에서 발견한 unreachable code, 중복 Response Builder, unused import 제거가 함께 포함된 결과입니다. 따라서 코드 Line 감소 자체보다 **Orchestrator → Feature Flow → Service로 책임 경계를 명확히 한 것**을 주요 개선 결과로 봅니다.
+
+리팩터링 과정에서 기존 Order Change Flow의 State 초기화 로직이 누락된 것도 발견하여 복구하고, 동일 문제가 다시 발생하지 않도록 Regression Test를 추가했습니다.
+
+세부 최적화 과정과 Before / After 기록은 `docs/optimization.md`에서 확인할 수 있습니다.
+
+
 
 ## 5. Key Design Decisions
 
