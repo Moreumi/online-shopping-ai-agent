@@ -793,6 +793,85 @@ collect_refund_account
 144 passed
 ```
 
+### Order Change Feature Flow 분리
+
+Order Change는 Orchestrator 내부에서 최초 요청 처리뿐 아니라 다음 3개의 Multi-turn Pending State를 직접 관리하고 있었다.
+
+```text
+order_change_selection
+order_change_quantity_input
+order_change_confirmation
+```
+
+수량 변경 과정은 다음과 같이 여러 단계가 연결된다.
+
+```text
+사용자 수량 변경 요청
+↓
+변경 가능 여부 확인
+↓
+주문 선택
+↓
+변경 수량 입력
+↓
+변경 Preview 생성
+↓
+사용자 최종 승인
+↓
+주문 수량 Write Action
+↓
+추가 결제 또는 부분 환불
+```
+
+따라서 단순한 Routing 분기가 아니라 하나의 독립된 Feature Flow로 판단하고 `order_change_flow.py`로 분리하였다.
+
+변경 후 책임은 다음과 같이 구분하였다.
+
+```text
+Orchestrator
+→ Order Change 기능 선택 및 Feature Flow 호출
+
+Order Change Flow
+→ 최초 요청 처리
+→ Multi-turn State 전이
+→ 사용자 최종 승인 처리
+→ 주문 변경 Service 호출
+→ 부분 환불 Flow 연결
+
+Service
+→ 주문 수량 변경 및 Refund 실제 처리
+```
+
+부분 환불 과정에서 계좌 정보가 필요한 경우 사용하는 `collect_refund_account`는 Order Change 전용 State가 아니라 주문 취소에서도 사용하는 공통 Refund State이므로 Order Change Flow로 이동하지 않았다.
+
+```text
+Order Change Flow
+↓
+부분 환불 시작
+↓
+계좌 정보 필요
+↓
+common collect_refund_account
+```
+
+리팩터링 과정에서 기존 최초 진입 로직과 비교하여, 변경 요청이 정상적인 진행 상태로 이어지지 않을 때 기존 Pending State를 초기화하던 `reset_state()` 처리가 누락된 것을 발견하였다. 이를 복구하고 이전 Pending State가 남지 않는지 확인하는 Regression Test를 추가하였다.
+
+최종 검증 결과는 다음과 같다.
+
+| 측정 항목                          | Optimization 2 시작 | Delivery/Cancel 분리 후 | Order Change 분리 후 |
+| ------------------------------ | ----------------: | -------------------: | ----------------: |
+| `orchestrator.py` Line 수       |             2,707 |                1,945 |             1,194 |
+| Orchestrator 직접 Pending Action |                13 |                    8 |                 5 |
+| 전체 Regression Test             |        144 passed |           144 passed |        146 passed |
+
+Optimization 2 시작 대비 `orchestrator.py`는 2,707줄에서 1,194줄로 1,513줄 감소하였다(약 55.9%).
+
+다만 이 감소량에는 Feature Flow 이동뿐 아니라 기존 unreachable code 제거, 중복 Response Builder 이동, unused import 정리가 함께 포함되어 있으므로 Feature Flow 분리만의 효과로 해석하지 않는다.
+
+핵심 개선 결과는 Orchestrator가 기능 내부의 Multi-turn 진행 방법까지 직접 관리하던 구조에서, **Orchestrator는 Feature 선택, Feature Flow는 상태 전이와 업무 흐름, Service는 실제 데이터 Action을 담당하도록 책임 경계를 분리한 것**이다.
+
+
+
 ---
 
 ## 2-6. 현재 정량 비교
